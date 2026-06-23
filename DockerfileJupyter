@@ -1,0 +1,115 @@
+# JupyterLab driver image for the Spark 4.1.2 cluster.
+# Built on the official Jupyter Docker Stacks image (Ubuntu-based) pinned to
+# Python 3.12 — same minor version as the Spark images (Ubuntu 24.04 / 3.12),
+# which PySpark requires. This base ships a curated, working JupyterLab + kernel
+# stack; we layer Spark 4.1.2 + jars on top. The demo notebooks use the default
+# Python 3 kernel + SparkSession.builder (no Livy / Spark Magic).
+FROM quay.io/jupyter/base-notebook:python-3.12
+
+ARG HADOOP_VERSION=3.4.2
+ARG AWS_SDK_VERSION=2.29.0
+ARG SPARK_VERSION=4.1.2
+ARG SCALA_BINARY=2.13
+ARG COMET_VERSION=0.16.0
+ARG TARGETARCH    # provided by buildx: amd64 | arm64
+
+ENV SPARK_HOME=/opt/spark
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-${TARGETARCH}
+
+# ---- OS deps: JDK17 + Hadoop native codec libs ----
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      openjdk-17-jdk-headless \
+      curl wget ca-certificates tzdata \
+      libgomp1 numactl \
+      libsnappy1v5 libzstd1 liblz4-1 libbz2-1.0 && \
+    rm -rf /var/lib/apt/lists/*
+
+# CA bundle path some libs expect (RHEL-style) - this comes from Gluten-Velox
+RUN mkdir -p /etc/pki/tls/certs && \
+    ln -sf /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt
+
+# Helper that resolves the closest/fastest Apache mirror (with CDN + archive
+# fallbacks) for downloading Apache dist tarballs.
+COPY --chmod=0755 scripts/apache-dl.sh /usr/local/bin/apache-dl
+
+# ---- Apache Spark (Hadoop3 build), from the fastest available Apache mirror ----
+RUN set -eux; \
+    mkdir -p /opt; \
+    apache-dl "spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop3.tgz" /tmp/spark.tgz; \
+    tar -xzf /tmp/spark.tgz -C /opt; \
+    ln -sT "/opt/spark-${SPARK_VERSION}-bin-hadoop3" "${SPARK_HOME}"; \
+    rm -f /tmp/spark.tgz
+
+# ---- Align Hadoop client + S3A (remove v1 AWS jars, add Hadoop ${HADOOP_VERSION} + AWS SDK v2) ----
+RUN set -eux; cd ${SPARK_HOME}/jars; \
+    find . -maxdepth 1 -type f -name 'hadoop-*.jar' -delete || true; \
+    find . -maxdepth 1 -type f -name 'aws-java-sdk-*.jar' -delete || true; \
+    wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-common/${HADOOP_VERSION}/hadoop-common-${HADOOP_VERSION}.jar; \
+    wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-auth/${HADOOP_VERSION}/hadoop-auth-${HADOOP_VERSION}.jar; \
+    wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-client-api/${HADOOP_VERSION}/hadoop-client-api-${HADOOP_VERSION}.jar; \
+    wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-client-runtime/${HADOOP_VERSION}/hadoop-client-runtime-${HADOOP_VERSION}.jar; \
+    wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_VERSION}/hadoop-aws-${HADOOP_VERSION}.jar; \
+    wget -q https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_VERSION}/bundle-${AWS_SDK_VERSION}.jar; \
+    wget -q https://repo1.maven.org/maven2/org/apache/spark/spark-hadoop-cloud_${SCALA_BINARY}/${SPARK_VERSION}/spark-hadoop-cloud_${SCALA_BINARY}-${SPARK_VERSION}.jar; \
+    wget -q https://repo1.maven.org/maven2/com/fasterxml/woodstox/woodstox-core/6.5.1/woodstox-core-6.5.1.jar; \
+    wget -q https://repo1.maven.org/maven2/org/codehaus/woodstox/stax2-api/4.2.2/stax2-api-4.2.2.jar
+
+# --- Native Hadoop libs (x86 only) ---
+# Hadoop 3.4.2 only ships x86_64 native libs, so install them on amd64 and skip
+# on arm64 (S3A falls back to Java codecs there). Not strictly needed by the
+# driver, but matches the Spark images when running on x86.
+ENV HADOOP_NATIVE_DIR=/opt/hadoop-native
+RUN set -eux; \
+  mkdir -p ${HADOOP_NATIVE_DIR}; \
+  if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
+    apache-dl "hadoop/common/hadoop-${HADOOP_VERSION}/hadoop-${HADOOP_VERSION}.tar.gz" /tmp/hadoop.tgz; \
+    tar -xzf /tmp/hadoop.tgz -C /tmp; \
+    cp -a /tmp/hadoop-${HADOOP_VERSION}/lib/native/* ${HADOOP_NATIVE_DIR}/; \
+    rm -rf /tmp/hadoop*; \
+    ldconfig || true; \
+  else \
+    echo "Skipping Hadoop native libs on ${TARGETARCH:-unknown} (no official build for Hadoop ${HADOOP_VERSION})"; \
+  fi
+ENV HADOOP_COMMON_LIB_NATIVE_DIR=${HADOOP_NATIVE_DIR}
+ENV LD_LIBRARY_PATH=${HADOOP_NATIVE_DIR}:${LD_LIBRARY_PATH}
+
+# ---- Apache DataFusion Comet + Structured Streaming Kafka connector jars ----
+# kafka-clients 3.9.1 / commons-pool2 2.12.1 are the versions Spark 4.1.x ships with.
+RUN set -eux; cd ${SPARK_HOME}/jars; \
+    wget -q https://repo1.maven.org/maven2/org/apache/datafusion/comet-spark-spark4.1_2.13/${COMET_VERSION}/comet-spark-spark4.1_2.13-${COMET_VERSION}.jar; \
+    wget -q https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_${SCALA_BINARY}/${SPARK_VERSION}/spark-sql-kafka-0-10_${SCALA_BINARY}-${SPARK_VERSION}.jar; \
+    wget -q https://repo1.maven.org/maven2/org/apache/spark/spark-token-provider-kafka-0-10_${SCALA_BINARY}/${SPARK_VERSION}/spark-token-provider-kafka-0-10_${SCALA_BINARY}-${SPARK_VERSION}.jar; \
+    wget -q https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.9.1/kafka-clients-3.9.1.jar; \
+    wget -q https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/2.12.1/commons-pool2-2.12.1.jar
+
+# ---- Spark defaults: JDK17 module opens to avoid Netty/JNI headaches ----
+RUN mkdir -p $SPARK_HOME/conf && cat >> $SPARK_HOME/conf/spark-defaults.conf <<'CONF'
+spark.driver.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-exports=java.base/jdk.internal.misc=ALL-UNNAMED -Dio.netty.tryReflectionSetAccessible=true
+spark.executor.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-exports=java.base/jdk.internal.misc=ALL-UNNAMED -Dio.netty.tryReflectionSetAccessible=true
+CONF
+RUN : > ${SPARK_HOME}/conf/spark-env.sh && chmod +x ${SPARK_HOME}/conf/spark-env.sh
+
+ENV PATH=${JAVA_HOME}/bin:${SPARK_HOME}/bin:${SPARK_HOME}/sbin:$PATH
+# Driver Python = the conda python3 (3.12). Executors use system python3 (3.12) on
+# the Spark workers; matching minor versions is what PySpark requires.
+ENV PYSPARK_PYTHON=python3
+ENV PYSPARK_DRIVER_PYTHON=python3
+
+# Driver Python = the conda python3 (3.12). Executors use system python3 (3.12) on
+# the Spark workers; matching minor versions is what PySpark requires.
+ENV PYSPARK_PYTHON=python3
+ENV PYSPARK_DRIVER_PYTHON=python3
+
+# ---- Python libs (into the conda env, as the notebook user) ----
+# The demo notebooks use the default Python 3 kernel + SparkSession.builder
+# (connecting straight to the standalone master) — no Livy / Spark Magic needed.
+USER ${NB_UID}
+# kafka-python 2.0.2 ships a vendored `six` that breaks on Python 3.12
+# (`from kafka.vendor.six.moves import range` -> ModuleNotFoundError). 2.1.0+
+# dropped the vendored six and added 3.12/3.13 support; pin the latest 2.2.x,
+# which keeps the same KafkaProducer/Consumer/AdminClient API the notebooks use.
+RUN pip install --no-cache-dir \
+      pyspark==${SPARK_VERSION} kafka-python==2.2.20 lz4
+
+WORKDIR /home/${NB_USER}/work

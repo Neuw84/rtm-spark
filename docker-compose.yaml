@@ -1,0 +1,180 @@
+networks:
+  spark-net:
+
+volumes:
+  spark-events:
+  kafka-data:
+
+x-spark-common: &spark-common
+  build:
+    context: .
+    dockerfile: ./DockerfileSpark
+  networks: [spark-net]
+  environment:
+    SPARK_NO_DAEMONIZE: "true"   # keep foreground process for Docker
+    SPARK_LOG_DIR: /opt/spark/logs  # optional but handy
+
+  restart: unless-stopped
+
+# shared env (so it can be merged per-service)
+x-spark-env: &spark-env
+  SPARK_NO_DAEMONIZE: "true"      # keep Spark in foreground
+  SPARK_LOG_DIR: /opt/spark/logs  # optional but handy
+
+services:
+  spark-master:
+    <<: *spark-common
+    container_name: spark-master
+    platform: linux/amd64
+    environment:
+      <<: *spark-env
+    hostname: spark-master
+    command: ["/opt/spark/sbin/start-master.sh"]
+    ports:
+      - "7077:7077"   # Spark master RPC
+      - "8080:8080"   # Spark master UI
+
+  spark-worker:
+    <<: *spark-common
+    container_name: spark-worker
+    hostname: spark-worker
+    platform: linux/amd64
+    depends_on: [spark-master]
+    # Adjust cores/memory as needed
+    environment:
+      - SPARK_WORKER_CORES=4
+      - SPARK_WORKER_MEMORY=4g
+      - SPARK_NO_DAEMONIZE=true      # keep Spark in foreground
+      - SPARK_LOG_DIR=/opt/spark/logs  # optional but handy
+
+    command: ["/opt/spark/sbin/start-worker.sh", "spark://spark-master:7077"]
+    ports:
+      - "8081:8081"   # Spark worker UI
+
+  spark-worker2:
+    <<: *spark-common
+    container_name: spark-worker2
+    hostname: spark-worker
+    platform: linux/amd64
+    depends_on: [spark-master]
+    # Adjust cores/memory as needed
+    environment:
+      - SPARK_WORKER_CORES=4
+      - SPARK_WORKER_MEMORY=4g
+      - SPARK_NO_DAEMONIZE=true      # keep Spark in foreground
+      - SPARK_LOG_DIR=/opt/spark/logs  # optional but handy
+
+    command: ["/opt/spark/sbin/start-worker.sh", "spark://spark-master:7077"]
+    ports:
+      - "8082:8081"   # Spark worker UI
+
+  spark-history:
+    <<: *spark-common
+    container_name: spark-history
+    hostname: spark-history
+    platform: linux/amd64
+    # History Server scans event logs written by apps
+    environment:
+      SPARK_HISTORY_OPTS: >-
+        -Dspark.history.fs.logDirectory=/opt/spark/spark-events
+        -Dspark.history.retainedApplications=50
+      SPARK_NO_DAEMONIZE: "true"      # keep Spark in foreground
+    command: ["/opt/spark/sbin/start-history-server.sh"]
+    volumes:
+      - spark-events:/opt/spark/spark-events
+    ports:
+      - "18080:18080" # History Server UI
+
+  jupyter:
+    build:
+      context: .
+      dockerfile: ./DockerfileJupyter
+    container_name: jupyter
+    hostname: jupyter
+    # No platform pin: run the JupyterLab driver NATIVELY (arm64 on Apple Silicon).
+    # Under linux/amd64 emulation, ipykernel's multithreaded ZMQ deadlocks and the
+    # kernel hangs at "Initializing". The driver talks to the (amd64) Spark cluster
+    # over JVM RPC, which is architecture-independent.
+    networks: [spark-net]
+    depends_on: [spark-master, kafka]
+    # NOTE: For local use we disable the token; secure appropriately in shared envs.
+    # The image CMD already launches JupyterLab, but we set it explicitly here too.
+    command: ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser",
+              "--ServerApp.token=", "--ServerApp.root_dir=/home/jovyan/work"]
+    environment:
+      # handy for your notebooks
+      - SPARK_MASTER=spark://spark-master:7077
+      - PYSPARK_PYTHON=python3
+      - PYSPARK_DRIVER_PYTHON=python3
+      # NOTE: do NOT set PYSPARK_DRIVER_PYTHON=jupyter / PYSPARK_DRIVER_PYTHON_OPTS here.
+      # The notebooks build the session with SparkSession.builder; those vars can make
+      # Spark try to launch a nested Jupyter server as the driver and hang.
+      # Kafka bootstrap reachable from inside the spark-net network
+      - KAFKA_BOOTSTRAP=kafka:9092
+    ports:
+      - "8888:8888"   # Jupyter UI
+      - "4040:4040"   # Spark Driver UI
+
+    volumes:
+      # Bind-mount this companion folder so realtime_streaming.ipynb and
+      # kafka_producer.py are immediately available at /home/jovyan/work.
+      # (The original repo used an empty named volume; a bind mount is friendlier
+      # for a self-contained demo. On Docker Desktop / macOS the uid translation
+      # makes the checkpoint dir under work/ writable by the jovyan user.)
+      - ./:/home/jovyan/work
+    restart: unless-stopped
+
+  # ---- Apache Kafka 4.x, single-node KRaft (no ZooKeeper) ----
+  # Combined broker + controller. PLAINTEXT for the docker network, and a
+  # separate PLAINTEXT_HOST listener so you can reach it from the host on 29092.
+  kafka:
+    image: apache/kafka:4.1.0
+    container_name: kafka
+    hostname: kafka
+    networks: [spark-net]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Single-node: everything replication factor 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      # Fixed cluster id so the formatted storage survives restarts
+      CLUSTER_ID: "kraft-spark41-demo-cluster"
+    ports:
+      - "29092:29092"  # host access -> localhost:29092
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    restart: unless-stopped
+
+  # One-shot helper: waits for the broker, then creates the demo topics.
+  # Real-time Mode uses a 1:1 mapping between topic partitions and reader tasks,
+  # so keep partition count <= available worker cores (8 here).
+  kafka-init:
+    image: apache/kafka:4.1.0
+    container_name: kafka-init
+    networks: [spark-net]
+    depends_on: [kafka]
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo 'Waiting for Kafka to be ready...'
+        for i in $$(seq 1 30); do
+          if /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1; then
+            break
+          fi
+          sleep 2
+        done
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic events-input  --partitions 6 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic events-output --partitions 6 --replication-factor 1
+        echo 'Topics ready:'
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+    restart: "no"
